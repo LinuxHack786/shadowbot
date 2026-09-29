@@ -21,7 +21,7 @@ if os.environ.get("PORT"):
     threading.Thread(target=start_render_health_server, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════════════
-# WAIFU COLLECTION BOT — FINAL v3.0 (Production Ready)
+# WAIFU COLLECTION BOT — FINAL v5.0
 # ═══════════════════════════════════════════════════════════════════
 
 import os, random, sqlite3, logging
@@ -60,6 +60,8 @@ RARITY_EMOJI = {
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("waifu_bot")
+
+_SPAWN_CACHE = {}
 
 
 # ═══════════ DATABASE ═══════════
@@ -261,7 +263,9 @@ def create_spawn(chat_id, waifu_id, expires_at):
         c = conn.cursor()
         c.execute("""INSERT INTO spawns (chat_id, waifu_id, expires_at)
                      VALUES (?,?,?)""", (chat_id, waifu_id, expires_at))
-        return c.lastrowid
+        sid = c.lastrowid
+    _SPAWN_CACHE.pop(chat_id, None)
+    return sid
 
 
 def set_spawn_message(sid, mid):
@@ -271,12 +275,22 @@ def set_spawn_message(sid, mid):
 
 
 def get_active_spawn(chat_id):
+    if chat_id in _SPAWN_CACHE:
+        cached = _SPAWN_CACHE[chat_id]
+        if cached is None:
+            return None
+        if cached.get("status") == "active":
+            return cached
+        _SPAWN_CACHE.pop(chat_id, None)
+
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("""SELECT * FROM spawns WHERE chat_id=? AND status='active'
                      ORDER BY id DESC LIMIT 1""", (chat_id,))
         row = c.fetchone()
-        return dict(row) if row else None
+        result = dict(row) if row else None
+        _SPAWN_CACHE[chat_id] = result
+        return result
 
 
 def close_spawn(sid, status="grabbed", grabbed_by=None):
@@ -284,6 +298,7 @@ def close_spawn(sid, status="grabbed", grabbed_by=None):
         c = conn.cursor()
         c.execute("UPDATE spawns SET status=?, grabbed_by=? WHERE id=?",
                   (status, grabbed_by, sid))
+    _SPAWN_CACHE.clear()
 
 
 def expire_spawns():
@@ -292,7 +307,10 @@ def expire_spawns():
         c = conn.cursor()
         c.execute("""UPDATE spawns SET status='expired'
                      WHERE status='active' AND expires_at<?""", (now,))
-        return c.rowcount
+        n = c.rowcount
+    if n:
+        _SPAWN_CACHE.clear()
+    return n
 
 
 # ═══════════ GROUP COUNTERS ═══════════
@@ -365,6 +383,16 @@ def kb_start():
     ])
 
 
+def kb_help():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👑 Owner", url=f"https://t.me/{OWNER_USERNAME}", style="primary")],
+        [InlineKeyboardButton("💬 Support", url=SUPPORT_LINK, style="success")],
+        [InlineKeyboardButton("➕ Add Me To Your GC",
+                              url=f"https://t.me/{BOT_USERNAME}?startgroup=true",
+                              style="primary")],
+    ])
+
+
 def kb_harem_open(uid, count):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🌸 Open Harem ({count})",
@@ -413,7 +441,7 @@ START_CAPTION = (
     "🌸 <b>Welcome to the Harem!</b>\n\n"
     "⚔️ <b>Kaise khelna:</b>\n"
     "▫️ Group me 100 messages pe waifu spawn hogi\n"
-    "▫️ Uska <b>naam</b> likh ke grab karo\n"
+    "▫️ Uska <b>naam dhundho</b> aur grab karo\n"
     "▫️ Apni collection <b>/myshadow</b> se dekho\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "📌 <b>Quick Commands:</b>\n"
@@ -422,6 +450,7 @@ START_CAPTION = (
     "▫️ /myshadow — Harem dekho\n"
     "▫️ /check — Waifu info\n"
     "▫️ /rank — Top collectors\n"
+    "▫️ /rarity — Rarity stats\n"
     "▫️ /global — Bot stats\n"
     "▫️ /help — Complete guide\n\n"
     f"💬 <b>Support:</b> <a href='{SUPPORT_LINK}'>{SUPPORT_NAME}</a>"
@@ -430,15 +459,29 @@ START_CAPTION = (
 
 async def cmd_start(update, context):
     u = update.effective_user
-    get_or_create_player(u.id, u.username, u.first_name)
+    try:
+        get_or_create_player(u.id, u.username, u.first_name)
+    except Exception as e:
+        log.error(f"Player create failed: {e}")
+
     try:
         await update.message.reply_photo(
-            photo=START_PHOTO, caption=START_CAPTION,
-            parse_mode="HTML", reply_markup=kb_start(),
+            photo=START_PHOTO,
+            caption=START_CAPTION,
+            parse_mode="HTML",
+            reply_markup=kb_start(),
+            read_timeout=10,
+            write_timeout=10,
+            connect_timeout=10,
         )
     except Exception as e:
         log.error(f"Start photo failed: {e}")
-        await update.message.reply_text(START_CAPTION, parse_mode="HTML", reply_markup=kb_start())
+        try:
+            await update.message.reply_text(
+                START_CAPTION, parse_mode="HTML", reply_markup=kb_start()
+            )
+        except Exception as e2:
+            log.error(f"Start text also failed: {e2}")
 
 
 # ═══════════ HELP ═══════════
@@ -447,30 +490,48 @@ HELP_TEXT = (
     "║   📖  <b>HOW TO PLAY</b>   ║\n"
     "╚══════════════════════════════╝\n\n"
     "🌑 <b>The Hunt Begins:</b>\n\n"
-    "1️⃣ Group me har <b>100 messages</b> pe waifu spawn hoti hai\n"
-    "2️⃣ Spawn message me uska <b>naam</b> dikhega\n"
-    "3️⃣ Wahi naam likh ke <code>/arise &lt;name&gt;</code> chalao\n"
-    "4️⃣ Sahi naam = waifu tumhari! Galat naam = no grab\n"
-    "5️⃣ <b>/myshadow</b> se apni harem dekho (album view)\n\n"
+    "1️⃣ Group me har <b>100 messages</b> pe waifu spawn\n"
+    "2️⃣ Spawn message me uska <b>naam nahi</b> likha hoga\n"
+    "3️⃣ Description padho, <b>naam dhundho</b>\n"
+    "4️⃣ Phir likho: <code>/arise &lt;name&gt;</code>\n"
+    "5️⃣ Sahi naam = waifu tumhari!\n"
+    "6️⃣ <b>/myshadow</b> se apni harem dekho\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "📌 <b>PLAYER COMMANDS:</b>\n"
-    "▫️ /start — Bot shuru karo\n"
-    "▫️ /arise &lt;name&gt; — Waifu grab karo\n"
-    "▫️ /viewtime — Gate kab khulega dekho\n"
-    "▫️ /myshadow — Apni harem dekho\n"
-    "▫️ /check &lt;id&gt; — Waifu ki info\n"
+    "▫️ /start — Bot shuru\n"
+    "▫️ /arise &lt;name&gt; — Waifu grab\n"
+    "▫️ /viewtime — Gate timer\n"
+    "▫️ /myshadow — Apni harem\n"
+    "▫️ /check &lt;id&gt; — Waifu info\n"
     "▫️ /rank — Top collectors\n"
-    "▫️ /global — Bot global stats\n"
-    "▫️ /help — Ye help\n\n"
-    f"💬 <b>Support:</b> <a href='{SUPPORT_LINK}'>{SUPPORT_NAME}</a>"
+    "▫️ /rarity — Rarity stats\n"
+    "▫️ /global — Bot stats\n"
+    "▫️ /help — Ye help"
 )
 
 
 async def cmd_help(update, context):
-    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+    try:
+        await update.message.reply_photo(
+            photo=START_PHOTO,
+            caption=HELP_TEXT,
+            parse_mode="HTML",
+            reply_markup=kb_help(),
+            read_timeout=10,
+            write_timeout=10,
+            connect_timeout=10,
+        )
+    except Exception as e:
+        log.error(f"Help photo failed: {e}")
+        try:
+            await update.message.reply_text(
+                HELP_TEXT, parse_mode="HTML", reply_markup=kb_help()
+            )
+        except Exception as e2:
+            log.error(f"Help text also failed: {e2}")
 
 
-# ═══════════ OHELP (OWNER + ADMINS) ═══════════
+# ═══════════ OHELP ═══════════
 OHELP_TEXT = (
     "╔══════════════════════════════╗\n"
     "║   👑  <b>OWNER / ADMIN HELP</b>   ║\n"
@@ -479,7 +540,7 @@ OHELP_TEXT = (
     "▫️ <code>/addshadow</code> — Naya waifu add karo\n"
     "   ├─ 📸 Pic bhej\n"
     "   ├─ 📝 Name bhej\n"
-    "   ├─ ⭐ Rarity chuno\n"
+    "   ├─ ⭐ Rarity chuno (button ya text)\n"
     "   └─ 📖 Description bhej\n\n"
     "▫️ <code>/waifulist</code> — Saari waifus list\n"
     "▫️ <code>/delwaifu &lt;id&gt;</code> — Waifu delete\n\n"
@@ -489,7 +550,10 @@ OHELP_TEXT = (
     "▫️ <code>/removeadmin</code> — Admin hata do\n"
     "▫️ <code>/admins</code> — Saare admins list\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "⚠️ <i>Ye info kisi ko na batao. Sirf admins ke liye.</i>"
+    "⚠️ <b>Important:</b>\n"
+    "<i>Description me waifu ka naam zaroor likho!</i>\n"
+    "<i>Jaise: \"Rem ek blue-haired maid hai\"</i>\n"
+    "<i>Warna user /arise nahi kar payega.</i>"
 )
 
 
@@ -520,7 +584,8 @@ async def cmd_arise(update, context):
             "╚══════════════════════════════╝\n\n"
             "🌑 <i>Yaha sab kuch naam se hi milta hai.</i>\n"
             "💡 <b>Usage:</b> <code>/arise &lt;name&gt;</code>\n"
-            "📌 <b>Example:</b> <code>/arise Rem</code>",
+            "📌 <b>Example:</b> <code>/arise Rem</code>\n\n"
+            "<i>Spawn message ki description padho — naam wahi milega.</i>",
             parse_mode="HTML"
         )
         return
@@ -547,7 +612,6 @@ async def cmd_arise(update, context):
     correct_name = (waifu.get("name") or "").strip().lower()
     user_name_lower = user_input.lower()
 
-    # ❌ GALAT NAAM
     if user_name_lower != correct_name:
         await update.message.reply_text(
             "╔══════════════════════════════╗\n"
@@ -557,15 +621,15 @@ async def cmd_arise(update, context):
             f"🔍 <i>Par ye naam kisi spawn se match nahi karta.</i>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "💡 <b>Kaise sahi kare:</b>\n"
-            "▫️ Upar spawn message me waifu ka naam dekho\n"
+            "▫️ Upar spawn message ki <b>description</b> padho\n"
+            "▫️ Usme waifu ka naam chhupa hai\n"
             "▫️ Wahi naam <b>exactly</b> likho\n"
-            "▫️ Case se farak nahi padta — spelling matter karti hai\n\n"
+            "▫️ Case se farak nahi padta\n\n"
             "🎯 <b>Example:</b> <code>/arise Rem</code>",
             parse_mode="HTML"
         )
         return
 
-    # ✅ SAHI NAAM
     give_waifu_to_user(u.id, waifu["id"])
     close_spawn(active["id"], "grabbed", u.id)
 
@@ -574,7 +638,6 @@ async def cmd_arise(update, context):
     name = waifu.get("name") or "Waifu"
     total_now = count_user_waifus(u.id)
 
-    # Rarity-based header
     if rarity == "Mythic":
         header = (
             "╔══════════════════════════════════╗\n"
@@ -640,17 +703,17 @@ async def cmd_viewtime(update, context):
     active = get_active_spawn(chat.id)
     if active:
         waifu = get_waifu(active["waifu_id"])
-        name = waifu.get("name") or "Unknown"
         rarity = waifu.get("rarity", "Common")
         re = RARITY_EMOJI.get(rarity, "⚪")
         await update.message.reply_text(
             "╔══════════════════════════════╗\n"
             "║  ⚠️  <b>WAIFU ALREADY SPAWNED</b>  ║\n"
             "╚══════════════════════════════╝\n\n"
-            f"🌸 <b>{name}</b>\n"
-            f"⭐ Rarity: {re} <b>{rarity}</b>\n\n"
+            f"⭐ Rarity: {re} <b>{rarity}</b>\n"
+            f"📖 <i>{waifu.get('description', '')[:200]}</i>\n\n"
             "👇 Upar spawn message pe jaake grab karo:\n"
-            f"<code>/arise {name}</code>",
+            "<code>/arise &lt;name&gt;</code>\n"
+            "<i>Naam description me chhupa hai!</i>",
             parse_mode="HTML"
         )
         return
@@ -706,7 +769,7 @@ async def cmd_myshadow(update, context):
         await update.message.reply_text(
             "🌑 <b>Tera Harem khaali hai.</b>\n\n"
             "👉 Group me 100 msg ka wait kar\n"
-            "👉 Jab waifu spawn ho, us pe reply karke <b>/arise</b> chala",
+            "👉 Jab waifu spawn ho, uska naam dhundh aur <b>/arise</b> chala",
             parse_mode="HTML"
         )
         return
@@ -864,6 +927,55 @@ async def cmd_rank(update, context):
     await update.message.reply_text(txt, parse_mode="HTML")
 
 
+# ═══════════ RARITY ═══════════
+async def cmd_rarity(update, context):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT rarity, COUNT(*) as cnt
+                     FROM waifus WHERE active=1
+                     GROUP BY rarity""")
+        rows = c.fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Abhi koi waifu nahi hai.")
+        return
+
+    rarity_order = ["Mythic", "Legendary", "Epic", "Rare", "Uncommon", "Common"]
+    counts = {r["rarity"]: r["cnt"] for r in rows}
+    total = sum(counts.values())
+    max_rarity = max(counts, key=counts.get) if counts else None
+
+    txt = (
+        "╔══════════════════════════════╗\n"
+        "║   💎  <b>RARITY STATISTICS</b>   ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "<i>\"Har rarity ka apna charm hai, Hunter.\"</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    for rar in rarity_order:
+        if rar in counts:
+            re = RARITY_EMOJI.get(rar, "⚪")
+            count = counts[rar]
+            pct = int((count / total) * 100)
+            filled = int(pct / 5)
+            bar = "█" * filled + "░" * (20 - filled)
+            mark = " 👑" if rar == max_rarity else ""
+            txt += (
+                f"{re} <b>{rar}</b>{mark}\n"
+                f"   <code>{bar}</code> <b>{count}</b> ({pct}%)\n\n"
+            )
+
+    txt += (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌸 <b>Total Waifus:</b> {total}\n"
+        f"👑 <b>Most Common:</b> {RARITY_EMOJI.get(max_rarity, '⚪')} <b>{max_rarity}</b>\n\n"
+        "<i>\"Collect them all, one by one.\"</i>"
+    )
+
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+
 # ═══════════ GLOBAL ═══════════
 async def cmd_global(update, context):
     with get_conn() as conn:
@@ -930,8 +1042,13 @@ async def addshadow_name(update, context):
         await update.message.reply_text("❌ Name 1-60 chars. Dobara:")
         return ASK_NAME
     context.user_data["name"] = name
-    await update.message.reply_text("⭐ <b>Rarity chuno:</b>",
-                                     parse_mode="HTML", reply_markup=kb_rarity())
+    await update.message.reply_text(
+        "⭐ <b>Rarity chuno:</b>\n\n"
+        "<i>Button dabao ya type karo:</i>\n"
+        "<code>Common, Uncommon, Rare, Epic, Legendary, Mythic</code>",
+        parse_mode="HTML",
+        reply_markup=kb_rarity()
+    )
     return ASK_RARITY
 
 
@@ -942,7 +1059,31 @@ async def addshadow_rarity_callback(update, context):
     context.user_data["rarity"] = rarity
     re = RARITY_EMOJI.get(rarity, "⚪")
     await q.edit_message_text(
-        f"⭐ Rarity: {re} <b>{rarity}</b>\n\n📖 Ab <b>Description bhej</b>:",
+        f"⭐ Rarity: {re} <b>{rarity}</b>\n\n"
+        f"📖 Ab <b>Description bhej</b>:\n\n"
+        f"<i>⚠️ Description me waifu ka naam zaroor likho!</i>\n"
+        f"<i>Jaise: \"Rem ek blue-haired maid hai\"</i>",
+        parse_mode="HTML"
+    )
+    return ASK_DESC
+
+
+async def addshadow_rarity_text(update, context):
+    r = update.message.text.strip().title()
+    valid = ["Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic"]
+    if r not in valid:
+        await update.message.reply_text(
+            f"❌ <b>Valid rarity likh:</b>\n"
+            f"<code>{'</code>, <code>'.join(valid)}</code>",
+            parse_mode="HTML"
+        )
+        return ASK_RARITY
+    context.user_data["rarity"] = r
+    re = RARITY_EMOJI.get(r, "⚪")
+    await update.message.reply_text(
+        f"⭐ Rarity: {re} <b>{r}</b>\n\n"
+        f"📖 Ab <b>Description bhej</b>:\n\n"
+        f"<i>⚠️ Description me waifu ka naam zaroor likho!</i>",
         parse_mode="HTML"
     )
     return ASK_DESC
@@ -1164,20 +1305,19 @@ async def spawn_waifu(chat_id, context):
 
     rarity = waifu.get("rarity", "Common")
     re = RARITY_EMOJI.get(rarity, "⚪")
-    name = waifu.get("name") or "Waifu"
 
     cap = (
         "╔══════════════════════════════╗\n"
-        "║   🌸  <b>A WAIFU HAS APPEARED</b>   ║\n"
+        "║  🌸  <b>A MYSTERIOUS WAIFU APPEARED</b>  ║\n"
         "╚══════════════════════════════╝\n\n"
-        f"👤 <b>{name}</b>\n"
-        f"⭐ Rarity: {re} <b>{rarity}</b>\n"
+        f"⭐ Rarity: {re} <b>{rarity}</b>\n\n"
         f"📖 <i>{waifu.get('description', '')}</i>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎯 <b>Grab karne ka tarika:</b>\n"
-        f"▫️ Naam likho: <code>/arise {name}</code>\n"
-        f"▫️ Case se farak nahi padta\n"
-        f"▫️ Galat naam = No grab\n\n"
+        "🎯 <b>Hunter ka kaam:</b>\n"
+        "▫️ Uska <b>naam dhundho</b> (description me hint hai)\n"
+        "▫️ Phir likho: <code>/arise &lt;name&gt;</code>\n"
+        "▫️ Case se farak nahi padta\n"
+        "▫️ Galat naam = No grab\n\n"
         f"⏰ <b>{SPAWN_EXPIRY_SECONDS}s</b> me gayab ho jaayegi!"
     )
     photo = waifu["image_url"] if waifu["image_source"] == "url" else waifu["file_id"]
@@ -1257,7 +1397,7 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ✅ Player Commands
+    # Player Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("arise", cmd_arise))
@@ -1266,9 +1406,10 @@ def main():
     app.add_handler(CommandHandler("myshadow", cmd_myshadow))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("rank", cmd_rank))
+    app.add_handler(CommandHandler("rarity", cmd_rarity))
     app.add_handler(CommandHandler("global", cmd_global))
 
-    # ✅ Owner/Admin Commands
+    # Owner/Admin Commands
     app.add_handler(CommandHandler("ohelp", cmd_ohelp))
     app.add_handler(CommandHandler("waifulist", cmd_waifulist))
     app.add_handler(CommandHandler("delwaifu", cmd_delwaifu))
@@ -1276,14 +1417,17 @@ def main():
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("admins", cmd_admins))
 
-    # ✅ Add Shadow Conversation — MUST BE BEFORE MessageHandler
+    # Add Shadow Conversation
     addshadow_conv = ConversationHandler(
         entry_points=[CommandHandler("addshadow", addshadow_start)],
         states={
             ASK_PHOTO:  [MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.TEXT,
                                          addshadow_photo)],
             ASK_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, addshadow_name)],
-            ASK_RARITY: [CallbackQueryHandler(addshadow_rarity_callback, pattern=r"^rarity:")],
+            ASK_RARITY: [
+                CallbackQueryHandler(addshadow_rarity_callback, pattern=r"^rarity:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, addshadow_rarity_text),
+            ],
             ASK_DESC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, addshadow_desc)],
         },
         fallbacks=[CommandHandler("cancel", addshadow_cancel)],
@@ -1292,10 +1436,10 @@ def main():
     )
     app.add_handler(addshadow_conv)
 
-    # ✅ Callbacks (after conversation)
+    # Callbacks
     app.add_handler(CallbackQueryHandler(callback_router))
 
-    # ✅ Message Tracker — MUST BE LAST (group=1)
+    # Message tracker (LAST)
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Sticker.ALL) & ~filters.COMMAND,
