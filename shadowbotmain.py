@@ -1,3 +1,6 @@
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import os, random, sqlite3, asyncio, logging
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -1089,6 +1092,27 @@ async def callback_router(update, context):
 
 
 # ==================== MAIN ====================
+
+# ==================== RENDER HEALTH SERVER ====================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Shadow Monarch Bot is alive")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info(f"🌐 Render health server listening on 0.0.0.0:{port}")
+    server.serve_forever()
+
+
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing in .env")
@@ -1134,6 +1158,13 @@ def main():
         app.job_queue.run_repeating(expire_job, interval=30, first=10)
 
     log.info("🌑 Shadow Monarch Bot starting...")
+
+    # Render Web Service port binding
+    threading.Thread(
+        target=start_health_server,
+        daemon=True
+    ).start()
+
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
