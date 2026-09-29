@@ -1,3 +1,25 @@
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class RenderHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ShadowBot is running")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_render_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), RenderHealthHandler)
+    server.serve_forever()
+
+if os.environ.get("PORT"):
+    threading.Thread(target=start_render_health_server, daemon=True).start()
+
 # ═══════════════════════════════════════════════════════════════════
 # WAIFU COLLECTION BOT — FINAL v3.0 (Production Ready)
 # ═══════════════════════════════════════════════════════════════════
