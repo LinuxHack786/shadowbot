@@ -2,7 +2,14 @@
 # WAIFU/HUSBANDO COLLECTION BOT — v8.6 FINAL
 # ═══════════════════════════════════════════════════════════════════
 
-import os, random, sqlite3, logging, io, time
+import os
+import io
+import sqlite3
+import random
+import threading
+import time
+import logging
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -24,6 +31,22 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "YourBotUsername")
 OWNER_ID = int(os.getenv("OWNER_ID", "8344335776"))
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "II_DEMONS_SHADOW_II")
+
+class RenderHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ShadowBot is alive")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_render_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), RenderHealthHandler)
+    server.serve_forever()
+
 SUPPORT_LINK = "https://t.me/Demon_persnality"
 SUPPORT_NAME = "Demon Personality"
 DB_PATH = os.getenv("DB_PATH", "shadow.db")
@@ -2023,6 +2046,7 @@ def main():
         app.job_queue.run_repeating(expire_job, interval=30, first=10)
 
     log.info("🌸 Waifu Bot v8.6 starting...")
+    threading.Thread(target=start_render_health_server, daemon=True).start()
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
