@@ -3,7 +3,36 @@
 # 33 Rarities + Global Search + Clean Army + Gift System
 # ═══════════════════════════════════════════════════════════════════
 
-import os, random, sqlite3, logging, io, time
+import os
+import threading
+import time
+import logging
+import random
+import sqlite3
+import io
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# ==================== RENDER HEALTH SERVER ====================
+
+class RenderHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ShadowBot is alive")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_render_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), RenderHealthHandler)
+    logging.info(f"🌐 Render health server listening on port {port}")
+    server.serve_forever()
+
+# ===============================================================
+
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -1636,6 +1665,7 @@ def main():
         app.job_queue.run_repeating(expire_job, interval=30, first=10)
 
     log.info("🌸 Waifu Bot v10.3 starting...")
+    threading.Thread(target=start_render_health_server, daemon=True).start()
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
