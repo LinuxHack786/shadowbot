@@ -1,3 +1,4 @@
+import asyncio
 # ═══════════════════════════════════════════════════════════════════
 # WAIFU/HUSBANDO COLLECTION BOT — v10.3 FINAL
 # 33 Rarities + Global Search + Clean Army + Gift System
@@ -447,17 +448,17 @@ JOIN_TEXT = "🔒 <b>Pehle dono channels join karo!</b>\n\nNeeche wale <b>dono c
 
 
 def kb_join():
-    rows = [[InlineKeyboardButton(f"📢 {ch}", url=url, style="primary")] for ch, url in REQUIRED_CHANNELS]
-    rows.append([InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="check_join", style="success")])
+    rows = [[InlineKeyboardButton(f"📢 {ch}", url=url)] for ch, url in REQUIRED_CHANNELS]
+    rows.append([InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="check_join")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_start():
     bot_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👑 Owner", url=f"https://t.me/{OWNER_USERNAME}", style="primary")],
-        [InlineKeyboardButton("💬 Support", url=SUPPORT_LINK, style="success")],
-        [InlineKeyboardButton("➕ Add Me To Your GC", url=bot_link, style="primary")],
+        [InlineKeyboardButton("👑 Owner", url=f"https://t.me/{OWNER_USERNAME}")],
+        [InlineKeyboardButton("💬 Support", url=SUPPORT_LINK)],
+        [InlineKeyboardButton("➕ Add Me To Your GC", url=bot_link)],
     ])
 
 
@@ -517,15 +518,15 @@ def kb_rarity():
     for i in range(0, len(items), 3):
         row = []
         for rarity, emoji in items[i:i+3]:
-            row.append(InlineKeyboardButton(f"{emoji} {rarity}", callback_data=f"rarity:{rarity}", style="primary"))
+            row.append(InlineKeyboardButton(f"{emoji} {rarity}", callback_data=f"rarity:{rarity}"))
         buttons.append(row)
     return InlineKeyboardMarkup(buttons)
 
 
 def kb_gender():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌸 Waifu", callback_data="gender:waifu", style="success"),
-         InlineKeyboardButton("🗡️ Husbando", callback_data="gender:husbando", style="primary")],
+        [InlineKeyboardButton("🌸 Waifu", callback_data="gender:waifu"),
+         InlineKeyboardButton("🗡️ Husbando", callback_data="gender:husbando")],
     ])
 
 
@@ -781,7 +782,7 @@ async def show_army_page(chat_id, context, user_obj, rarity=None, page=0):
     if total == 0:
         ft = f" ({rarity})" if rarity else ""
         await context.bot.send_message(chat_id, f"🌑 <b>Koi character nahi{ft}.</b>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Close", callback_data="army_close", style="danger")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Close", callback_data="army_close")]]))
         return
     start = page * COLLAGE_PER_PAGE; end = start + COLLAGE_PER_PAGE
     page_waifus = waifus[start:end]
@@ -889,8 +890,8 @@ async def cmd_search(update, context):
             f"📖 <i>{w.get('description', '')}</i>"
         )
         action_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📦 Open Army", callback_data="army_filter:all:0", style="success" if owned else "primary")],
-            [InlineKeyboardButton("👤 Owner", url=f"https://t.me/{OWNER_USERNAME}", style="primary")],
+            [InlineKeyboardButton("📦 Open Army", callback_data="army_filter:all:0" if owned else "primary")],
+            [InlineKeyboardButton("👤 Owner", url=f"https://t.me/{OWNER_USERNAME}")],
         ])
         photo = w["image_url"] if w["image_source"] == "url" else w["file_id"]
         try: await update.message.reply_photo(photo, caption=cap, parse_mode="HTML", reply_markup=action_kb)
@@ -1539,7 +1540,7 @@ async def callback_router(update, context):
             f"<i>{w.get('description', '')}</i>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back to Army", callback_data="army_filter:all:0", style="primary")],
+            [InlineKeyboardButton("🔙 Back to Army", callback_data="army_filter:all:0")],
         ])
         photo = w["image_url"] if w["image_source"] == "url" else w["file_id"]
         try: await q.message.delete()
@@ -1574,7 +1575,7 @@ async def callback_router(update, context):
             f"💡 <i>/gift &lt;user_id&gt; {wid} se gift kar sakte ho</i>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back", callback_data="army_filter:all:0", style="primary")],
+            [InlineKeyboardButton("🔙 Back", callback_data="army_filter:all:0")],
         ])
         photo = w["image_url"] if w["image_source"] == "url" else w["file_id"]
         try: await q.message.delete()
@@ -1598,7 +1599,7 @@ async def callback_router(update, context):
             "💡 <b>Global Search</b> — poori database me search!",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Army", callback_data="army_filter:all:0", style="primary")]
+                [InlineKeyboardButton("🔙 Back to Army", callback_data="army_filter:all:0")]
             ]))
         return
 
@@ -1613,6 +1614,7 @@ async def callback_router(update, context):
 
 
 def main():
+    asyncio.set_event_loop(asyncio.new_event_loop())
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing in .env"); return
     init_db()
