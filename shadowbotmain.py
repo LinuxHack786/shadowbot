@@ -1,4 +1,4 @@
-# bot.py — Waifu Collection Bot v16
+# bot.py — Waifu Collection Bot v18.1
 # target: Python 3.11 · python-telegram-bot 21.x · Pillow 10+
 import os, io, time, math, shutil, random, sqlite3, logging, threading
 from contextlib import contextmanager
@@ -34,7 +34,7 @@ REQUIRED_CHANNELS = [
 ]
 
 SPAWN_MESSAGE_THRESHOLD = 100
-SPAWN_EXPIRY_SECONDS    = 300
+SPAWN_EXPIRY_SECONDS    = 600   # 10 minutes
 
 DAILY_COINS     = 100
 WEEKLY_COINS    = 2000
@@ -43,8 +43,9 @@ WEEKLY_COOLDOWN = timedelta(days=7)
 CLAIM_COOLDOWN  = timedelta(hours=24)
 
 BACKUP_DIR = "backups"
-AMODE_SERIES_PER_PAGE = 5
+AMODE_SERIES_PER_PAGE  = 5
 AMODE_CHARS_PER_SERIES = 8
+CARD_BTN_PER_PAGE      = 12
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("waifu_bot")
@@ -139,12 +140,9 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         for tbl, col, typ in [
-            ("players","coins","INTEGER DEFAULT 0"),
-            ("players","last_daily","TEXT"),
-            ("players","last_weekly","TEXT"),
-            ("players","last_claim","TEXT"),
-            ("waifus","series","TEXT DEFAULT ''"),
-            ("waifus","series_order","INTEGER DEFAULT 0"),
+            ("players","coins","INTEGER DEFAULT 0"),("players","last_daily","TEXT"),
+            ("players","last_weekly","TEXT"),("players","last_claim","TEXT"),
+            ("waifus","series","TEXT DEFAULT ''"),("waifus","series_order","INTEGER DEFAULT 0"),
         ]:
             try: c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
             except sqlite3.OperationalError: pass
@@ -158,7 +156,6 @@ def init_db():
 
 
 def _now(): return datetime.now(timezone.utc)
-
 def _parse_dt(s):
     if not s: return None
     try:
@@ -295,8 +292,7 @@ def get_all_series():
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("""SELECT DISTINCT series FROM waifus
-            WHERE active=1 AND series IS NOT NULL AND series != ''
-            ORDER BY series""")
+            WHERE active=1 AND series IS NOT NULL AND series != '' ORDER BY series""")
         return [r["series"] for r in c.fetchall()]
 
 
@@ -353,6 +349,14 @@ def get_user_waifus_grouped(user_id):
         s = (r.get("series") or "Unknown Series").strip() or "Unknown Series"
         grouped.setdefault(s, []).append(r)
     return grouped
+
+
+def get_flat_user_waifus(user_id):
+    grouped = get_user_waifus_grouped(user_id)
+    out = []
+    for _, items in grouped.items():
+        out.extend(items)
+    return out
 
 
 def get_series_totals(user_id=None):
@@ -463,6 +467,21 @@ def expire_spawns():
         c = conn.cursor()
         c.execute("UPDATE spawns SET status='expired' WHERE status='active' AND expires_at<?", (now,))
         return c.rowcount
+
+
+def get_expired_spawns_with_msg():
+    """Expired spawns whose Telegram message is still registered — need deletion."""
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT id, chat_id, message_id FROM spawns
+                     WHERE status='expired' AND message_id IS NOT NULL""")
+        return [dict(r) for r in c.fetchall()]
+
+
+def clear_spawn_message(sid):
+    """Drop message_id after deletion so we don't try again."""
+    with get_conn() as conn:
+        conn.execute("UPDATE spawns SET message_id=NULL WHERE id=?", (sid,))
 
 
 def incr_msg(chat_id):
@@ -637,13 +656,13 @@ async def render_detail(context, client, row, banner_name, dup_count, series_pai
     draw.text((22, y + 20), f"{banner_name}'s harem", fill=GOLD, font=f_banner)
     y += BANNER_H
     draw.rectangle([0, y, CARD_W, y + INFO_H], fill=(34, 30, 24))
-    rows = [
+    rows_data = [
         ("🍀", f"Name:  {row.get('name','')}  (x{dup_count})"),
         ("💙", f"Rarity:  {row.get('rarity','')}"),
         ("🏵️", f"Anime:  {row.get('series','')}  ({series_pair[0]}/{series_pair[1]})"),
         ("🆔", f"{row.get('waifu_id', row.get('id',''))}  -  Needed for trading/gifting"),
     ]
-    for i, (emj, txt) in enumerate(rows):
+    for i, (emj, txt) in enumerate(rows_data):
         ry = y + 16 + i * ROW_H
         draw.text((22, ry), f"{emj}  {txt}", fill=TEXT, font=f_info)
     draw.rectangle([0, 0, CARD_W - 1, H - 1], outline=GOLD, width=3)
@@ -702,6 +721,28 @@ def kb_start():
         [InlineKeyboardButton("💬 Support", url=SUPPORT_LINK)],
         [InlineKeyboardButton("➕ Add Me To Your GC", url=bot_link)],
     ])
+
+
+def _kb_card_buttons(flat, page):
+    total_pages = max(1, math.ceil(len(flat) / CARD_BTN_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * CARD_BTN_PER_PAGE
+    slice_ = flat[start:start + CARD_BTN_PER_PAGE]
+    rows = []; buf = []
+    for w in slice_:
+        re = RARITY_EMOJI.get(w.get("rarity", "Common"), "⚪")
+        label = f"{re} {w.get('name','?')[:16]}"
+        buf.append(InlineKeyboardButton(label, callback_data=f"card_det:{w['waifu_id']}:{page}"))
+        if len(buf) == 2:
+            rows.append(buf); buf = []
+    if buf: rows.append(buf)
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"card_btn:{page-1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="card_noop"))
+    if page < total_pages - 1: nav.append(InlineKeyboardButton("Next ▶", callback_data=f"card_btn:{page+1}"))
+    if nav: rows.append(nav)
+    rows.append([InlineKeyboardButton("📖 Text List", callback_data="amode_open:0")])
+    return InlineKeyboardMarkup(rows), total_pages, page
 
 
 # ═══════════════ TEXTS ═══════════════
@@ -857,7 +898,7 @@ async def cmd_arise(update, context):
         await update.message.reply_text(cap, parse_mode="HTML", reply_markup=kb)
 
 
-# ─── AMODE — text list collection ───
+# ─── AMODE ───
 def _build_amode_text(user_obj, page=0):
     grouped = get_user_waifus_grouped(user_obj.id)
     if not grouped:
@@ -867,10 +908,8 @@ def _build_amode_text(user_obj, page=0):
     page = max(0, min(page, total_pages - 1))
     page_series = series_list[page * AMODE_SERIES_PER_PAGE:(page + 1) * AMODE_SERIES_PER_PAGE]
     totals_map = get_series_totals(user_obj.id)
-
     name = user_obj.first_name or "Hunter"
     total_waifus = sum(len(v) for _, v in series_list)
-
     lines = [
         f"🌸 <b>{name}'s Collection</b> — Page {page+1}/{total_pages}",
         "━━━━━━━━━━━━━━━━━━━━━━",
@@ -885,8 +924,6 @@ def _build_amode_text(user_obj, page=0):
         if len(items) > AMODE_CHARS_PER_SERIES:
             lines.append(f"   <i>… +{len(items)-AMODE_CHARS_PER_SERIES} more</i>")
         lines.append("")
-
-    # nav buttons
     rows = []
     nav = []
     if page > 0:
@@ -894,13 +931,12 @@ def _build_amode_text(user_obj, page=0):
     nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="amode_noop"))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton("Next ▶", callback_data=f"amode_page:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(f"📖 Army ({total_waifus})", callback_data="amode_show_army")])
-    kb = InlineKeyboardMarkup(rows)
-
-    text = "\n".join(lines)
-    return text, kb, page, total_pages
+    if nav: rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(f"🔍 Character Cards", callback_data="card_btn:0"),
+        InlineKeyboardButton(f"📖 Army ({total_waifus})", callback_data="amode_show_army"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows), page, total_pages
 
 
 async def cmd_amode(update, context):
@@ -918,8 +954,7 @@ async def cmd_amode(update, context):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-async def _send_army_grid(chat_id, context, user_obj):
-    """Full gallery grid image, no buttons, scrollable."""
+async def _send_army(chat_id, context, user_obj, card_page=0):
     grouped = get_user_waifus_grouped(user_obj.id)
     if not grouped:
         await context.bot.send_message(chat_id, "🌑 Your army is empty.")
@@ -937,15 +972,20 @@ async def _send_army_grid(chat_id, context, user_obj):
         buf, is_tall = await render_harem(context, client, grouped, totals)
         try: await wait.delete()
         except Exception: pass
-        # clean — no buttons, user scrolls top-to-bottom
+        flat = get_flat_user_waifus(user_obj.id)
+        markup, _, _ = _kb_card_buttons(flat, card_page)
+        caption = f"🌸 <b>Your Army</b> — {total} characters\n\nTap a character below to view its card."
         if is_tall:
-            await context.bot.send_document(chat_id=chat_id, document=buf, filename="harem.jpg")
+            await context.bot.send_document(chat_id=chat_id, document=buf, filename="harem.jpg",
+                caption=caption, parse_mode="HTML", reply_markup=markup)
         else:
             try:
-                await context.bot.send_photo(chat_id=chat_id, photo=buf)
+                await context.bot.send_photo(chat_id=chat_id, photo=buf, caption=caption,
+                    parse_mode="HTML", reply_markup=markup)
             except Exception:
                 buf.seek(0)
-                await context.bot.send_document(chat_id=chat_id, document=buf, filename="harem.jpg")
+                await context.bot.send_document(chat_id=chat_id, document=buf, filename="harem.jpg",
+                    caption=caption, parse_mode="HTML", reply_markup=markup)
     except Exception as e:
         log.error(f"harem render: {e}")
         try: await wait.edit_text("❌ Render failed.")
@@ -961,10 +1001,50 @@ async def cmd_army(update, context):
     if count_user_waifus(u.id) == 0:
         await update.message.reply_text(
             "🌑 <b>Your army is empty.</b>\n\nWait for a spawn and use /arise."); return
-    await _send_army_grid(update.message.chat_id, context, u)
+    await _send_army(update.message.chat_id, context, u)
 
 
-# ─── Search ───
+async def _show_detail_card(chat_id, context, user_obj, waifu_id, back_page=0):
+    w = get_waifu(waifu_id)
+    if not w:
+        await context.bot.send_message(chat_id, "❌ Character not found.")
+        return
+    dups = count_user_dups(user_obj.id, waifu_id)
+    if dups == 0:
+        await context.bot.send_message(chat_id, "❌ Not in your army.")
+        return
+    totals = get_series_totals(user_obj.id).get(w.get("series", ""), (0, 0))
+    banner = user_obj.first_name or "Hunter"
+    client = context.bot_data.get("httpx")
+    if client is None:
+        client = httpx.AsyncClient()
+        context.bot_data["httpx"] = client
+    wait = await context.bot.send_message(chat_id, "⏳ Rendering card...")
+    try:
+        row = {
+            "id": w["id"], "waifu_id": w["id"],
+            "name": w["name"], "rarity": w["rarity"],
+            "series": w.get("series", ""),
+            "file_id": w.get("file_id"), "image_url": w.get("image_url"),
+            "image_source": w.get("image_source"),
+        }
+        buf = await render_detail(context, client, row, banner, dups, totals, BOT_USERNAME)
+        try: await wait.delete()
+        except Exception: pass
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Send Pic", callback_data=f"send_raw:{waifu_id}"),
+                InlineKeyboardButton("🔙 Back", callback_data=f"card_btn:{back_page}"),
+            ]
+        ])
+        await context.bot.send_photo(chat_id=chat_id, photo=buf,
+            parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        log.error(f"detail render: {e}")
+        try: await wait.edit_text("❌ Render failed.")
+        except Exception: pass
+
+
 async def cmd_search(update, context):
     u = update.effective_user
     if not context.args:
@@ -1013,13 +1093,12 @@ async def cmd_search(update, context):
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
 
-# ─── Gift ───
 async def cmd_gift(update, context):
     u = update.effective_user
     if len(context.args) < 2:
         await update.message.reply_text(
-            "🎁 <b>Gift a character</b>\n\n"
-            "<code>/gift &lt;user_id&gt; &lt;waifu_id&gt;</code>", parse_mode="HTML"); return
+            "🎁 <b>Gift a character</b>\n\n<code>/gift &lt;user_id&gt; &lt;waifu_id&gt;</code>",
+            parse_mode="HTML"); return
     try:
         target_id = int(context.args[0]); wid = int(context.args[1])
     except ValueError:
@@ -1028,13 +1107,13 @@ async def cmd_gift(update, context):
         await update.message.reply_text("😐 You cannot gift yourself."); return
     w = get_waifu(wid)
     if not w:
-        await update.message.reply_text(f"❌ Character ID {wid} not found."); return
+        await update.message.reply_text(f"❌ ID {wid} not found."); return
     match = find_user_waifu(u.id, wid)
     if not match:
-        await update.message.reply_text(f"❌ <b>{w.get('name')}</b> is not in your army."); return
+        await update.message.reply_text(f"❌ Not in your army."); return
     try: await context.bot.get_chat(target_id)
     except Exception:
-        await update.message.reply_text("❌ Target user not reachable."); return
+        await update.message.reply_text("❌ Target not reachable."); return
     give_waifu_to_user(target_id, wid)
     remove_user_waifu(match["uw_id"], u.id)
     rar = w.get("rarity", "Common"); re = RARITY_EMOJI.get(rar, "⚪")
@@ -1057,12 +1136,11 @@ async def cmd_gift(update, context):
     except Exception: pass
 
 
-# ─── Coins ───
 async def cmd_balance(update, context):
     u = update.effective_user
     get_or_create_player(u.id, u.username, u.first_name)
-    await update.message.reply_text(
-        f"💰 <b>Balance:</b> <code>{get_coins(u.id)}</code> coins", parse_mode="HTML")
+    await update.message.reply_text(f"💰 <b>Balance:</b> <code>{get_coins(u.id)}</code> coins",
+                                    parse_mode="HTML")
 
 
 async def cmd_daily(update, context):
@@ -1075,17 +1153,13 @@ async def cmd_daily(update, context):
         await update.message.reply_text(
             f"⏳ <b>Daily already claimed</b>\n"
             f"Come back in <b>{h}h {m}m</b>\n"
-            f"Balance: <code>{get_coins(u.id)}</code>",
-            parse_mode="HTML"); return
+            f"Balance: <code>{get_coins(u.id)}</code>", parse_mode="HTML"); return
     add_coins(u.id, DAILY_COINS)
     with get_conn() as conn:
         conn.execute("UPDATE players SET last_daily=? WHERE user_id=?", (now.isoformat(), u.id))
     await update.message.reply_text(
-        f"✅ <b>Daily claimed</b>\n"
-        f"💰 +{DAILY_COINS} coins\n"
-        f"💼 Balance: <b>{get_coins(u.id)}</b>\n"
-        f"⏰ Next in 24h",
-        parse_mode="HTML")
+        f"✅ <b>Daily claimed</b>\n💰 +{DAILY_COINS} coins\n"
+        f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 24h", parse_mode="HTML")
 
 
 async def cmd_weekly(update, context):
@@ -1098,17 +1172,13 @@ async def cmd_weekly(update, context):
         await update.message.reply_text(
             f"⏳ <b>Weekly already claimed</b>\n"
             f"Come back in <b>{d}d {h}h</b>\n"
-            f"Balance: <code>{get_coins(u.id)}</code>",
-            parse_mode="HTML"); return
+            f"Balance: <code>{get_coins(u.id)}</code>", parse_mode="HTML"); return
     add_coins(u.id, WEEKLY_COINS)
     with get_conn() as conn:
         conn.execute("UPDATE players SET last_weekly=? WHERE user_id=?", (now.isoformat(), u.id))
     await update.message.reply_text(
-        f"✅ <b>Weekly claimed</b>\n"
-        f"💰 +{WEEKLY_COINS} coins\n"
-        f"💼 Balance: <b>{get_coins(u.id)}</b>\n"
-        f"⏰ Next in 7 days",
-        parse_mode="HTML")
+        f"✅ <b>Weekly claimed</b>\n💰 +{WEEKLY_COINS} coins\n"
+        f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 7 days", parse_mode="HTML")
 
 
 async def cmd_claim(update, context):
@@ -1119,8 +1189,7 @@ async def cmd_claim(update, context):
         left = CLAIM_COOLDOWN - (now - last)
         h = left.seconds // 3600; m = (left.seconds % 3600) // 60
         await update.message.reply_text(
-            f"⏳ <b>Claim on cooldown</b>\nCome back in <b>{h}h {m}m</b>",
-            parse_mode="HTML"); return
+            f"⏳ <b>Claim on cooldown</b>\nCome back in <b>{h}h {m}m</b>", parse_mode="HTML"); return
     w = get_random_waifu(weighted=True)
     if not w:
         await update.message.reply_text("🌑 No characters in DB yet."); return
@@ -1157,7 +1226,7 @@ async def cmd_shop(update, context):
                 callback_data=f"shop_buy:{w['id']}")])
         buttons.append([InlineKeyboardButton("🔙 Categories", callback_data="shop_cats")])
         await update.message.reply_text(
-            f"🛒 <b>SHOP — {RARITY_EMOJI.get(rar,'⚪')} {rar}</b>\n💰 Price: <b>{price}</b> coins",
+            f"🛒 <b>SHOP — {rar}</b>\n💰 Price: <b>{price}</b> coins",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)); return
     counts = get_all_rarity_counts()
     buttons = []; row = []
@@ -1167,7 +1236,7 @@ async def cmd_shop(update, context):
                                         callback_data=f"shop_cat:{r}"))
         if len(row) == 2: buttons.append(row); row = []
     if row: buttons.append(row)
-    await update.message.reply_text("🛒 <b>SHOP</b>\n\nChoose a category to browse:",
+    await update.message.reply_text("🛒 <b>SHOP</b>\n\nChoose a category:",
                                     parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -1177,8 +1246,7 @@ async def cmd_stats(update, context):
     total = count_user_waifus(u.id); coins = get_coins(u.id)
     if total == 0:
         await update.message.reply_text(
-            f"📊 <b>Your stats are empty.</b>\n💰 Coins: <b>{coins}</b>",
-            parse_mode="HTML"); return
+            f"📊 <b>Empty stats.</b>\n💰 Coins: <b>{coins}</b>", parse_mode="HTML"); return
     gc = get_user_gender_counts(u.id); rc = get_user_rarity_counts(u.id)
     txt = (
         "╔══════════════════════════════╗\n"
@@ -1191,8 +1259,7 @@ async def cmd_stats(update, context):
     )
     for r in RARITY_ORDER:
         if r in rc:
-            re = RARITY_EMOJI.get(r, "⚪")
-            txt += f"{re} {r}: <b>{rc[r]}</b>\n"
+            txt += f"{RARITY_EMOJI.get(r, '⚪')} {r}: <b>{rc[r]}</b>\n"
     await update.message.reply_text(txt, parse_mode="HTML")
 
 
@@ -1223,8 +1290,7 @@ async def cmd_rarity(update, context):
     txt = "💎 <b>RARITY STATS</b>\n\n"
     for r in RARITY_ORDER:
         if r in counts:
-            re = RARITY_EMOJI.get(r, "⚪")
-            txt += f"{re} {r}: <b>{counts[r]}</b>\n"
+            txt += f"{RARITY_EMOJI.get(r, '⚪')} {r}: <b>{counts[r]}</b>\n"
     txt += f"\n🌸 Total: <b>{total}</b>"
     await update.message.reply_text(txt, parse_mode="HTML")
 
@@ -1239,8 +1305,7 @@ async def cmd_global(update, context):
     await update.message.reply_text(
         "🌍 <b>GLOBAL STATS</b>\n\n"
         f"💬 Groups: <b>{groups}</b>\n👥 Players: <b>{users}</b>\n"
-        f"🌸 Characters: <b>{waifus}</b>\n📦 Collected: <b>{collected}</b>",
-        parse_mode="HTML")
+        f"🌸 Characters: <b>{waifus}</b>\n📦 Collected: <b>{collected}</b>", parse_mode="HTML")
 
 
 async def cmd_ping(update, context):
@@ -1260,7 +1325,7 @@ async def cmd_viewtime(update, context):
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("❌ Group only."); return
     if get_active_spawn(chat.id):
-        await update.message.reply_text("⚠️ A spawn is already active."); return
+        await update.message.reply_text("⚠️ Spawn already active."); return
     stats = get_group_stats(chat.id)
     cur = stats["msg_count"]; total = stats["total_spawns"]
     rem = max(0, SPAWN_MESSAGE_THRESHOLD - cur)
@@ -1268,13 +1333,13 @@ async def cmd_viewtime(update, context):
     bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
     await update.message.reply_text(
         f"🌑 <b>GATE STATUS</b>\n\n📨 {cur}/{SPAWN_MESSAGE_THRESHOLD}\n"
-        f"📊 <code>{bar}</code> {pct}%\n\n⏳ <b>{rem}</b> messages until next spawn\n"
-        f"🎯 Total spawns: <b>{total}</b>", parse_mode="HTML")
+        f"📊 <code>{bar}</code> {pct}%\n\n⏳ <b>{rem}</b> until next spawn\n"
+        f"🎯 Total: <b>{total}</b>", parse_mode="HTML")
 
 
 async def cmd_check(update, context):
     if not context.args:
-        await update.message.reply_text("📌 Usage: <code>/check &lt;id&gt;</code>", parse_mode="HTML"); return
+        await update.message.reply_text("📌 <code>/check &lt;id&gt;</code>", parse_mode="HTML"); return
     try: wid = int(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ Invalid ID."); return
@@ -1301,12 +1366,12 @@ ASK_PHOTO, ASK_NAME, ASK_GENDER, ASK_RARITY, ASK_SERIES, ASK_SERIES_NEW, ASK_DES
 def _kb_series_choice():
     series_list = get_all_series()
     buttons = []; row = []
-    for s in series_list[:24]:
+    for s in series_list[:20]:
         row.append(InlineKeyboardButton(s[:28], callback_data=f"series_pick:{s}"))
         if len(row) == 2: buttons.append(row); row = []
     if row: buttons.append(row)
     buttons.append([InlineKeyboardButton("➕ New Series", callback_data="series_new")])
-    buttons.append([InlineKeyboardButton("⏭ Skip (Unknown Series)", callback_data="series_pick:Unknown Series")])
+    buttons.append([InlineKeyboardButton("⏭ Skip", callback_data="series_pick:Unknown Series")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1321,7 +1386,8 @@ def _kb_rarity():
 
 async def addshadow_start(update, context):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only."); return ConversationHandler.END
+        await update.message.reply_text("❌ Admin only.")
+        return ConversationHandler.END
     context.user_data.clear()
     await update.message.reply_text("📸 Send the image (photo, image file, or URL).")
     return ASK_PHOTO
@@ -1336,8 +1402,9 @@ async def addshadow_photo(update, context):
     elif update.message.text and update.message.text.startswith(("http://","https://")):
         url = update.message.text.strip()
     else:
-        await update.message.reply_text("❌ Send a photo, image file, or URL."); return ASK_PHOTO
-    context.user_data["file_id"] = fid; context.user_data["image_url"] = url
+        await update.message.reply_text("❌ Send photo / image / URL."); return ASK_PHOTO
+    context.user_data["file_id"] = fid
+    context.user_data["image_url"] = url
     await update.message.reply_text("📝 Send the character name.")
     return ASK_NAME
 
@@ -1347,7 +1414,7 @@ async def addshadow_name(update, context):
         await update.message.reply_text("❌ Send text."); return ASK_NAME
     name = update.message.text.strip()
     if not name or len(name) > 60:
-        await update.message.reply_text("❌ 1-60 characters."); return ASK_NAME
+        await update.message.reply_text("❌ 1-60 chars."); return ASK_NAME
     context.user_data["name"] = name
     await update.message.reply_text("🌸 Waifu or Husbando?",
         reply_markup=InlineKeyboardMarkup([[
@@ -1370,7 +1437,7 @@ async def addshadow_gender_txt(update, context):
     if g not in ("waifu","husbando"):
         await update.message.reply_text("❌ 'waifu' or 'husbando'."); return ASK_GENDER
     context.user_data["gender"] = g
-    await update.message.reply_text(f"Type: {gender_label(g)}\n\n⭐ Choose rarity:", reply_markup=_kb_rarity())
+    await update.message.reply_text(f"Type: {gender_label(g)}\n\n⭐ Rarity:", reply_markup=_kb_rarity())
     return ASK_RARITY
 
 
@@ -1381,7 +1448,7 @@ async def addshadow_rarity_cb(update, context):
         await q.answer("Invalid!", show_alert=True); return ASK_RARITY
     context.user_data["rarity"] = r
     await q.edit_message_text(
-        f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Pick a series (tap) or add new:",
+        f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Pick a series:",
         reply_markup=_kb_series_choice())
     return ASK_SERIES
 
@@ -1393,7 +1460,7 @@ async def addshadow_rarity_txt(update, context):
         await update.message.reply_text("❌ Invalid rarity."); return ASK_RARITY
     context.user_data["rarity"] = r
     await update.message.reply_text(
-        f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Pick a series (tap) or add new:",
+        f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Pick a series:",
         reply_markup=_kb_series_choice())
     return ASK_SERIES
 
@@ -1402,9 +1469,7 @@ async def addshadow_series_pick_cb(update, context):
     q = update.callback_query; await q.answer()
     series = q.data.split(":", 1)[1]
     context.user_data["series"] = series
-    await q.edit_message_text(
-        f"📺 Series: <b>{series}</b>\n\n📖 Now send the description.",
-        parse_mode="HTML")
+    await q.edit_message_text(f"📺 Series: <b>{series}</b>\n\n📖 Send description.", parse_mode="HTML")
     return ASK_DESC
 
 
@@ -1419,25 +1484,21 @@ async def addshadow_series_new_txt(update, context):
         await update.message.reply_text("❌ Send text."); return ASK_SERIES_NEW
     s = update.message.text.strip()
     if not s or len(s) > 80:
-        await update.message.reply_text("❌ 1-80 characters."); return ASK_SERIES_NEW
+        await update.message.reply_text("❌ 1-80 chars."); return ASK_SERIES_NEW
     context.user_data["series"] = s
-    await update.message.reply_text(
-        f"📺 Series: <b>{s}</b>\n\n📖 Now send the description.",
-        parse_mode="HTML")
+    await update.message.reply_text(f"📺 Series: <b>{s}</b>\n\n📖 Send description.", parse_mode="HTML")
     return ASK_DESC
 
 
 async def addshadow_series_txt(update, context):
     if not update.message.text:
-        await update.message.reply_text("❌ Send text or tap a button."); return ASK_SERIES
+        await update.message.reply_text("❌ Send text or tap button."); return ASK_SERIES
     s = update.message.text.strip()
     if s.lower() == "skip": s = "Unknown Series"
     if len(s) > 80:
         await update.message.reply_text("❌ Too long."); return ASK_SERIES
     context.user_data["series"] = s
-    await update.message.reply_text(
-        f"📺 Series: <b>{s}</b>\n\n📖 Now send the description.",
-        parse_mode="HTML")
+    await update.message.reply_text(f"📺 Series: <b>{s}</b>\n\n📖 Send description.", parse_mode="HTML")
     return ASK_DESC
 
 
@@ -1446,7 +1507,7 @@ async def addshadow_desc(update, context):
         await update.message.reply_text("❌ Send text."); return ASK_DESC
     desc = update.message.text.strip()
     if not desc or len(desc) > 500:
-        await update.message.reply_text("❌ 1-500 characters."); return ASK_DESC
+        await update.message.reply_text("❌ 1-500 chars."); return ASK_DESC
     d = context.user_data
     mid = add_waifu(name=d.get("name",""), gender=d.get("gender","waifu"),
                     rarity=d.get("rarity","Common"), file_id=d.get("file_id"),
@@ -1509,22 +1570,21 @@ async def cmd_setseries(update, context):
         await update.message.reply_text("❌ Admin only."); return
     if len(context.args) < 2:
         await update.message.reply_text(
-            "📌 <b>Usage:</b> <code>/setseries &lt;waifu_id&gt; &lt;series_name&gt;</code>\n"
-            "Example: <code>/setseries 42 Classroom of the Elite</code>", parse_mode="HTML"); return
+            "📌 <code>/setseries &lt;id&gt; &lt;name&gt;</code>", parse_mode="HTML"); return
     try: wid = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid waifu_id."); return
+        await update.message.reply_text("❌ Invalid id."); return
     series = " ".join(context.args[1:]).strip()
     if not series or len(series) > 80:
-        await update.message.reply_text("❌ Series name 1-80 characters."); return
+        await update.message.reply_text("❌ Series 1-80 chars."); return
     w = get_waifu(wid)
     if not w:
         await update.message.reply_text(f"❌ ID {wid} not found."); return
     if set_waifu_series(wid, series):
         await update.message.reply_text(
-            f"✅ Updated\n\n🆔 <code>{wid}</code>\n🌸 {w.get('name')}\n📺 {series}", parse_mode="HTML")
+            f"✅ Updated\n🆔 <code>{wid}</code>\n🌸 {w.get('name')}\n📺 {series}", parse_mode="HTML")
     else:
-        await update.message.reply_text("❌ Update failed.")
+        await update.message.reply_text("❌ Failed.")
 
 
 async def cmd_status(update, context):
@@ -1535,18 +1595,16 @@ async def cmd_status(update, context):
         c.execute("SELECT COUNT(*) FROM waifus WHERE active=1"); total = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM user_waifus"); grabbed = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM players"); users = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM spawns"); spawns = c.fetchone()[0]
     await update.message.reply_text(
         f"🗄️ <b>STATUS</b>\n\n🌸 Characters: <b>{total}</b>\n"
-        f"🎯 Grabs: <b>{grabbed}</b>\n👥 Players: <b>{users}</b>\n⚡ Spawns: <b>{spawns}</b>",
-        parse_mode="HTML")
+        f"🎯 Grabs: <b>{grabbed}</b>\n👥 Players: <b>{users}</b>", parse_mode="HTML")
 
 
 async def cmd_backup(update, context):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only."); return
     if not os.path.exists(DB_PATH):
-        await update.message.reply_text("❌ DB file not found."); return
+        await update.message.reply_text("❌ DB not found."); return
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1555,10 +1613,9 @@ async def cmd_backup(update, context):
         size_kb = os.path.getsize(dst) // 1024
         await update.message.reply_document(
             document=open(dst, "rb"), filename=f"shadow_{stamp}.db",
-            caption=f"💾 <b>Backup created</b>\n\n📁 <code>{dst}</code>\n📦 Size: <b>{size_kb} KB</b>",
-            parse_mode="HTML")
+            caption=f"💾 Backup: {size_kb} KB", parse_mode="HTML")
     except Exception as e:
-        await update.message.reply_text(f"❌ Backup failed: {e}")
+        await update.message.reply_text(f"❌ Failed: {e}")
 
 
 async def cmd_addadmin(update, context):
@@ -1575,9 +1632,9 @@ async def cmd_addadmin(update, context):
     else:
         await update.message.reply_text("📌 Reply or give ID."); return
     if tid == OWNER_ID:
-        await update.message.reply_text("❌ Owner is already admin."); return
+        await update.message.reply_text("❌ Already owner."); return
     if add_admin(tid, update.effective_user.id):
-        await update.message.reply_text(f"✅ Admin added: {tname} (<code>{tid}</code>)", parse_mode="HTML")
+        await update.message.reply_text(f"✅ Admin: {tname} (<code>{tid}</code>)", parse_mode="HTML")
     else:
         await update.message.reply_text("⚠️ Already admin.")
 
@@ -1585,18 +1642,15 @@ async def cmd_addadmin(update, context):
 async def cmd_removeadmin(update, context):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Owner only."); return
-    tid = tname = None
+    tid = None
     if update.message.reply_to_message:
         tid = update.message.reply_to_message.from_user.id
-        tname = update.message.reply_to_message.from_user.first_name
     elif context.args:
-        try: tid = int(context.args[0]); tname = f"User {tid}"
+        try: tid = int(context.args[0])
         except ValueError:
-            await update.message.reply_text("❌ Invalid ID."); return
-    else:
-        await update.message.reply_text("📌 Reply or give ID."); return
-    if remove_admin(tid):
-        await update.message.reply_text(f"✅ Admin removed: {tname}")
+            await update.message.reply_text("❌ Invalid."); return
+    if tid and remove_admin(tid):
+        await update.message.reply_text(f"✅ Removed: {tid}")
     else:
         await update.message.reply_text("⚠️ Not an admin.")
 
@@ -1605,13 +1659,9 @@ async def cmd_admins(update, context):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Owner only."); return
     admins = get_all_admins()
-    txt = f"👑 <b>ADMINS</b>\n\n👤 Owner: <code>{OWNER_ID}</code>\n\n"
-    for a in admins:
-        try:
-            u = await context.bot.get_chat(a["user_id"]); name = u.first_name
-        except Exception: name = "Unknown"
-        txt += f"▫️ {name} — <code>{a['user_id']}</code>\n"
-    if not admins: txt += "📭 No additional admins."
+    txt = f"👑 <b>ADMINS</b>\n\nOwner: <code>{OWNER_ID}</code>\n\n"
+    for a in admins: txt += f"▫️ <code>{a['user_id']}</code>\n"
+    if not admins: txt += "📭 None."
     await update.message.reply_text(txt, parse_mode="HTML")
 
 
@@ -1646,29 +1696,37 @@ async def spawn_waifu(chat_id, context):
 
 
 async def expire_job(context):
+    # 1) mark any active spawn past its expiry time
     n = expire_spawns()
     if n: log.info(f"expired {n} spawns")
 
+    # 2) delete the Telegram message of every expired spawn
+    rows = get_expired_spawns_with_msg()
+    for r in rows:
+        try:
+            await context.bot.delete_message(
+                chat_id=r["chat_id"], message_id=r["message_id"])
+        except Exception as e:
+            log.debug(f"spawn msg delete skipped ({r['chat_id']}/{r['message_id']}): {e}")
+        finally:
+            clear_spawn_message(r["id"])
+    if rows:
+        log.info(f"deleted {len(rows)} expired spawn messages")
 
-# ─── bot username mention → grid ───
+
 async def on_bot_mention(update, context):
     msg = update.message
-    if not msg or not msg.text:
-        return
-    uname_tag = f"@{BOT_USERNAME}"
-    if uname_tag.lower() not in msg.text.lower():
-        return
+    if not msg or not msg.text: return
+    if f"@{BOT_USERNAME}".lower() not in msg.text.lower(): return
     u = msg.from_user
-    if not u or u.is_bot:
-        return
+    if not u or u.is_bot: return
     try: get_or_create_player(u.id, u.username, u.first_name)
     except Exception: pass
     if count_user_waifus(u.id) == 0:
-        try:
-            await msg.reply_text("🌑 Your collection is empty. Use /arise to grab first.")
+        try: await msg.reply_text("🌑 Your collection is empty. Use /arise first.")
         except Exception: pass
         return
-    await _send_army_grid(msg.chat_id, context, u)
+    await _send_army(msg.chat_id, context, u)
 
 
 # ═══════════════ CALLBACKS ═══════════════
@@ -1679,7 +1737,6 @@ async def callback_router(update, context):
     if data == "check_join":
         ok, reason = await is_joined(context.bot, q.from_user.id)
         if ok:
-            await q.answer("✅ Verified!", show_alert=True)
             try: await q.edit_message_text("🟢 Verified! Use /amode to open your collection.")
             except Exception: pass
         else:
@@ -1688,23 +1745,19 @@ async def callback_router(update, context):
 
     if data.startswith("amode_open:"):
         page = int(data.split(":")[1])
-        u = q.from_user
-        if count_user_waifus(u.id) == 0:
-            await q.answer("Empty collection.", show_alert=True); return
-        text, kb, _, _ = _build_amode_text(u, page=page)
-        try:
-            await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        if count_user_waifus(q.from_user.id) == 0:
+            await q.answer("Empty.", show_alert=True); return
+        text, kb, _, _ = _build_amode_text(q.from_user, page=page)
+        try: await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception: pass
         return
 
     if data.startswith("amode_page:"):
         page = int(data.split(":")[1])
-        u = q.from_user
-        text, kb, _, _ = _build_amode_text(u, page=page)
+        text, kb, _, _ = _build_amode_text(q.from_user, page=page)
         if text is None:
             await q.answer("Empty.", show_alert=True); return
-        try:
-            await q.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        try: await q.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception:
             try: await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
             except Exception: pass
@@ -1713,7 +1766,37 @@ async def callback_router(update, context):
     if data == "amode_noop": return
 
     if data == "amode_show_army":
-        await _send_army_grid(q.message.chat_id, context, q.from_user)
+        await _send_army(q.message.chat_id, context, q.from_user)
+        return
+
+    if data.startswith("card_btn:"):
+        page = int(data.split(":")[1])
+        flat = get_flat_user_waifus(q.from_user.id)
+        if not flat:
+            await q.answer("Empty.", show_alert=True); return
+        markup, _, _ = _kb_card_buttons(flat, page)
+        try: await q.message.edit_reply_markup(reply_markup=markup)
+        except Exception: pass
+        return
+
+    if data == "card_noop": return
+
+    if data.startswith("card_det:"):
+        parts = data.split(":")
+        wid = int(parts[1]); back_page = int(parts[2]) if len(parts) > 2 else 0
+        await _show_detail_card(q.message.chat_id, context, q.from_user, wid, back_page)
+        return
+
+    if data.startswith("send_raw:"):
+        wid = int(data.split(":")[1])
+        w = get_waifu(wid)
+        if not w:
+            await q.answer("Not found.", show_alert=True); return
+        photo = w["image_url"] if w["image_source"] == "url" else w["file_id"]
+        try: await context.bot.send_photo(q.message.chat_id, photo)
+        except Exception:
+            try: await context.bot.send_document(q.message.chat_id, photo)
+            except Exception as e: await q.answer(f"fail: {e}", show_alert=True)
         return
 
     if data.startswith("search_det:"):
@@ -1762,7 +1845,7 @@ async def callback_router(update, context):
         buttons.append([InlineKeyboardButton("🔙 Categories", callback_data="shop_cats")])
         try:
             await q.edit_message_text(
-                f"🛒 <b>SHOP — {RARITY_EMOJI.get(rar,'⚪')} {rar}</b>\n💰 Price: <b>{price}</b> coins",
+                f"🛒 <b>SHOP — {rar}</b>\n💰 <b>{price}</b>",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
         except Exception: pass
         return
@@ -1771,68 +1854,29 @@ async def callback_router(update, context):
         wid = int(data.split(":")[1])
         w = get_waifu(wid)
         if not w:
-            await q.answer("Character missing.", show_alert=True); return
+            await q.answer("Missing.", show_alert=True); return
         price = rarity_price(w.get("rarity","Common"))
         balance = get_coins(q.from_user.id)
         if balance < price:
-            await q.answer(f"❌ Need {price} coins. You have {balance}.", show_alert=True); return
+            await q.answer(f"❌ Need {price}. You have {balance}.", show_alert=True); return
         add_coins(q.from_user.id, -price)
         give_waifu_to_user(q.from_user.id, wid)
-        await q.answer(f"✅ Bought {w.get('name')} for {price} coins!", show_alert=True)
+        await q.answer(f"✅ Bought {w.get('name')}!", show_alert=True)
         return
-
-    log.warning(f"unhandled callback: {data}")
 
 
 # ═══════════════ MAIN ═══════════════
 def main():
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN missing in .env"); return
+        print("❌ BOT_TOKEN missing"); return
     if not OWNER_ID:
-        print("❌ OWNER_ID missing in .env"); return
+        print("❌ OWNER_ID missing"); return
 
     _auto_backup()
     init_db()
     start_health_server()
 
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # bot mention handler — runs in group 0, before tracking
-    mention_pattern = f"@{BOT_USERNAME}"
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, on_bot_mention), group=0)
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("ohelp", cmd_ohelp))
-    app.add_handler(CommandHandler("arise", cmd_arise))
-    app.add_handler(CommandHandler("guess", cmd_arise))
-    app.add_handler(CommandHandler("amode", cmd_amode))
-    app.add_handler(CommandHandler("army", cmd_army))
-    app.add_handler(CommandHandler("search", cmd_search))
-    app.add_handler(CommandHandler("gift", cmd_gift))
-    app.add_handler(CommandHandler("daily", cmd_daily))
-    app.add_handler(CommandHandler("weekly", cmd_weekly))
-    app.add_handler(CommandHandler("claim", cmd_claim))
-    app.add_handler(CommandHandler("shop", cmd_shop))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("rank", cmd_rank))
-    app.add_handler(CommandHandler("rarity", cmd_rarity))
-    app.add_handler(CommandHandler("global", cmd_global))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("viewtime", cmd_viewtime))
-    app.add_handler(CommandHandler("gate", cmd_viewtime))
-    app.add_handler(CommandHandler("check", cmd_check))
-
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("waifulist", cmd_waifulist))
-    app.add_handler(CommandHandler("delwaifu", cmd_delwaifu))
-    app.add_handler(CommandHandler("setseries", cmd_setseries))
-    app.add_handler(CommandHandler("backup", cmd_backup))
-    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
-    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
-    app.add_handler(CommandHandler("admins", cmd_admins))
 
     addshadow_conv = ConversationHandler(
         entry_points=[CommandHandler("addshadow", addshadow_start)],
@@ -1853,17 +1897,34 @@ def main():
         fallbacks=[CommandHandler("cancel", addshadow_cancel)],
         per_user=True, per_chat=False,
     )
-    app.add_handler(addshadow_conv)
+    app.add_handler(addshadow_conv, group=0)
 
-    app.add_handler(CallbackQueryHandler(callback_router))
+    for name, fn in [
+        ("start", cmd_start), ("help", cmd_help), ("ohelp", cmd_ohelp),
+        ("arise", cmd_arise), ("guess", cmd_arise),
+        ("amode", cmd_amode), ("army", cmd_army),
+        ("search", cmd_search), ("gift", cmd_gift),
+        ("daily", cmd_daily), ("weekly", cmd_weekly), ("claim", cmd_claim),
+        ("shop", cmd_shop), ("balance", cmd_balance), ("stats", cmd_stats),
+        ("rank", cmd_rank), ("rarity", cmd_rarity), ("global", cmd_global),
+        ("ping", cmd_ping), ("viewtime", cmd_viewtime), ("gate", cmd_viewtime),
+        ("check", cmd_check),
+        ("status", cmd_status), ("waifulist", cmd_waifulist), ("delwaifu", cmd_delwaifu),
+        ("setseries", cmd_setseries), ("backup", cmd_backup),
+        ("addadmin", cmd_addadmin), ("removeadmin", cmd_removeadmin), ("admins", cmd_admins),
+    ]:
+        app.add_handler(CommandHandler(name, fn), group=0)
+
+    app.add_handler(CallbackQueryHandler(callback_router), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_bot_mention), group=5)
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Sticker.ALL) & ~filters.COMMAND,
-        track_message), group=1)
+        track_message), group=10)
 
     if app.job_queue:
         app.job_queue.run_repeating(expire_job, interval=30, first=10)
 
-    log.info("Waifu Bot v16 starting...")
+    log.info("Waifu Bot v18.1 starting...")
 
     # Python 3.14 compatibility: explicitly create the main event loop
     # before python-telegram-bot's run_polling() accesses it.
